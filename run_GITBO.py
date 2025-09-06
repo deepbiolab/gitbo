@@ -15,6 +15,26 @@ from torch.quasirandom import SobolEngine
 import warnings
 warnings.filterwarnings("ignore")
 
+def reset_device_memory(device: torch.device):
+    """Reset memory stats depending on device type."""
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+    elif device.type == "mps":
+        # MPS doesn't support empty_cache/reset_peak_memory_stats
+        # Just a no-op
+        pass
+
+def get_max_memory_allocated(device: torch.device) -> float:
+    """Return peak memory used in bytes, if supported."""
+    if device.type == "cuda":
+        return torch.cuda.max_memory_allocated()
+    elif device.type == "mps":
+        # torch.mps.current_allocated_memory() exists, but not peak
+        return torch.mps.current_allocated_memory()
+    else:
+        return 0.0  # CPU fallback
+
 @dataclass
 class Unified_TS_State:
     """
@@ -657,8 +677,8 @@ def compute_acquisition_values(
     """
 
     # reset stats
-    torch.cuda.reset_peak_memory_stats()
-    torch.cuda.empty_cache()
+    reset_device_memory(torch.device(DEVICE))
+    peak_bytes = get_max_memory_allocated(torch.device(DEVICE))
 
     regressor = VanillaDirectTabPFNRegressor(device=GPU_DEVICE)
     single_eval_pos = trained_X.shape[0]
@@ -931,6 +951,108 @@ def sample_dominant_subspace(
 
     return X_pen, U_r, eigenvals
 
+def compute_acquisition_values(
+    Acquisition: str,
+    DIM: int,
+    sobol_engine,
+    N_PENDING: int,
+    N_CANDIDATES: int,
+    PFN_MODEL,  # Not used in v2 but kept for interface compatibility
+    trained_X: torch.Tensor,
+    trained_Y: torch.Tensor,
+    GX: torch.Tensor,
+    X_pen: torch.Tensor,
+    Function,
+    DEVICE: str,
+    tr_lb=None,
+    tr_ub=None,
+    state=None,
+    weights=None,
+    batch_size=None,
+    GPU_DEVICE="cuda:0",
+    tkwargs=None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Compute acquisition values using TabPFN v2 model, with memory‑efficient gradient estimation.
+    Returns: (acquisition_values [N_PENDING×N_CANDIDATES], constraint_values=None, grad_est [N_PENDING×N_CANDIDATES×DIM])
+    """
+    
+    # reset stats
+    reset_device_memory(torch.device(DEVICE))
+    peak_bytes = get_max_memory_allocated(torch.device(DEVICE))
+
+    regressor = VanillaDirectTabPFNRegressor(device=GPU_DEVICE)
+    single_eval_pos = trained_X.shape[0]
+    
+    # report
+    peak_bytes = torch.cuda.max_memory_allocated()
+    # print(f"Peak GPU memory used: {peak_bytes/2**20:.2f} MiB")
+
+    # --- build the full X and Y concatenation ---
+    X_train = trained_X.unsqueeze(1).expand(-1, N_CANDIDATES, -1)           # [single_eval_pos, N_CANDIDATES, DIM]
+    X_full  = torch.cat([X_train, X_pen], dim=0)                            # [(single_eval_pos+N_PENDING), N_CANDIDATES, DIM]
+
+    Y_pad   = torch.zeros(N_PENDING, 1, **tkwargs)                          # [N_PENDING, 1]
+    Y_full  = torch.cat([trained_Y, Y_pad], dim=0).unsqueeze(1)             # [(single_eval_pos+N_PENDING), 1, 1]
+    Y_full  = Y_full.expand(-1, N_CANDIDATES, -1)                           # [(single_eval_pos+N_PENDING), N_CANDIDATES, 1]
+
+    # --- split off the candidate portion for gradient tracking ---
+    X_train_det = X_full[:single_eval_pos].detach()
+    X_cand      = X_full[single_eval_pos:].clone().requires_grad_()         # [N_PENDING, N_CANDIDATES, DIM]
+    X_concat    = torch.cat([X_train_det, X_cand], dim=0).to(GPU_DEVICE)
+
+    # --- get devices ---
+    amp_dtype = tkwargs["dtype"]
+    amp_device = GPU_DEVICE
+    peak_bytes = torch.cuda.max_memory_allocated()
+
+
+    if Acquisition in ['EI', 'TR_EI']:
+        # --- forward + EI under autocast for mixed precision ---
+        with torch.amp.autocast(device_type=amp_device, dtype=amp_dtype):
+            out    = regressor.forward(X_concat, Y_full, single_eval_pos)
+            logits = out["standard"]
+            acq    = regressor.predict_ei(logits, trained_Y.max())            # [ (single_eval_pos+N_PENDING), N_CANDIDATES ]
+        # take only the candidate rows
+        EI      = acq[single_eval_pos:]                                      # [N_PENDING, N_CANDIDATES]
+
+        # --- gradient only wrt X_cand ---
+        grad_cand, = torch.autograd.grad(EI.sum(), X_cand, retain_graph=False, create_graph=False)
+        grad_est   = -grad_cand.view(N_PENDING, N_CANDIDATES, DIM).detach()
+
+        return EI.to(**tkwargs), None, grad_est.to(**tkwargs)
+
+    elif Acquisition in ['ThompsonSampling', 'TR_TS']:
+        # --- forward + mean/variance under autocast ---
+        with torch.amp.autocast(device_type=amp_device, dtype=amp_dtype):
+            out             = regressor.forward(X_concat, Y_full, single_eval_pos)
+            logits          = out["standard"]
+            output_mean     = regressor.predict_mean(logits)                   # [ (single_eval_pos+N_PENDING), N_CANDIDATES ]
+            output_variance = regressor.predict_variance(logits)               # same shape
+
+        # print('forward pass done')
+
+        mu_cand  = output_mean[single_eval_pos:]                              # [N_PENDING, N_CANDIDATES]
+        var_cand = output_variance[single_eval_pos:]
+        std_cand = torch.clamp(var_cand, min=1e-8).sqrt()
+
+        # --- sample if requested ---
+        sample_count = 512
+        mu_expanded  = mu_cand.unsqueeze(-1).expand(-1, -1, sample_count)
+        std_expanded = std_cand.unsqueeze(-1).expand(-1, -1, sample_count)
+        sampled_y    = torch.normal(mu_expanded, std_expanded).mean(dim=-1)
+
+        # --- gradient only wrt X_cand, using the mean as loss ---
+        loss       = mu_cand.sum()
+        grad_cand, = torch.autograd.grad(loss, X_cand, retain_graph=False, create_graph=False)
+        grad_est   = -grad_cand.view(N_PENDING, N_CANDIDATES, DIM).detach()
+        
+        # print('grad done')
+
+        return sampled_y.to(**tkwargs), None, grad_est.to(**tkwargs)
+
+    else:
+        raise ValueError(f"Unknown acquisition type: {Acquisition}")
 
 def run_multiple_trials(args, n_trials=5):
     """Run GITBO multiple times and collect results"""
@@ -946,10 +1068,11 @@ def run_multiple_trials(args, n_trials=5):
         random_seed = np.random.randint(0, 2**31)
         print(f"Trial {trial + 1} random_seed: {random_seed}")
 
-        # Clear GPU memory before each trial
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            torch.cuda.reset_peak_memory_stats()
+        # # Clear GPU memory before each trial
+        # if torch.cuda.is_available():
+        #     torch.cuda.empty_cache()
+        #     torch.cuda.reset_peak_memory_stats()
+        reset_device_memory(torch.device(args.GPU_DEVICE))
 
         # Track memory usage
         memory_usage = []
@@ -957,27 +1080,27 @@ def run_multiple_trials(args, n_trials=5):
         # Modified GITBO call to track memory
         def memory_tracking_gitbo(*args, **kwargs):
             # Store original function
-            import _GITBO
-
-            original_compute = _GITBO.compute_acquisition_values
+            global compute_acquisition_values
+            original_compute = compute_acquisition_values
 
             # Create wrapper to track memory
             def compute_with_memory_tracking(*compute_args, **compute_kwargs):
                 result = original_compute(*compute_args, **compute_kwargs)
                 if torch.cuda.is_available():
-                    memory_usage.append(
-                        torch.cuda.max_memory_allocated() / (1024**3)
-                    )  # GB
+                    # memory_usage.append(
+                    #     torch.cuda.max_memory_allocated() / (1024**3)
+                    # )  # GB
+                    memory_usage.append(get_max_memory_allocated(torch.device(args.GPU_DEVICE)) / (1024**3))
                 return result
 
             # Temporarily replace function
-            _GITBO.compute_acquisition_values = compute_with_memory_tracking
+            compute_acquisition_values = compute_with_memory_tracking
 
             # Run GITBO
             result = GITBO(*args, **kwargs)
 
             # Restore original function
-            _GITBO.compute_acquisition_values = original_compute
+            compute_acquisition_values = original_compute
 
             return result
 
@@ -1220,10 +1343,9 @@ class Ackley(BenchmarkProblem):
         from botorch.test_functions import Ackley as Ackley_imported
 
         device = torch.device(X.device)
-        dtype = torch.double
+        dtype = torch.float32 if device.type == "mps" else torch.float64
 
         X = super().scale(X, to_verify)
-
         n = X.size(0)
 
         gx = torch.zeros((n, self.num_cons))
@@ -1260,8 +1382,8 @@ if __name__ == "__main__":
     parser.add_argument("--N_PENDING", type=int, default=1000, help="N_PENDING")
     parser.add_argument("--CONSTRAINED", action="store_true", help="CONSTRAINED")
     parser.add_argument("--TRIAL", type=int, default=0, help="TRIAL")
-    parser.add_argument("--DEVICE", type=str, default="cuda:0", help="DEVICE")
-    parser.add_argument("--GPU_DEVICE", type=str, default="cuda:0", help="GPU_DEVICE")
+    parser.add_argument("--DEVICE", type=str, default="mps", help="DEVICE")
+    parser.add_argument("--GPU_DEVICE", type=str, default="mps", help="GPU_DEVICE")
     parser.add_argument("--RANK_R", type=int, default=15, help="RANK_R")
     parser.add_argument("--SAMPLE_SCALE", type=float, default=0.2, help="SAMPLE_SCALE")
     parser.add_argument("--GI_SUBSPACE", type=bool, default=True, help="GI_SUBSPACE")
