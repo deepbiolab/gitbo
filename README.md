@@ -1,4 +1,4 @@
-# GIT-BO: High-Dimensional Bayesian Optimization with Tabular Foundation Models
+# High-Dimensional Bayesian Optimization with Tabular Foundation Models
 
 # Requirements
 
